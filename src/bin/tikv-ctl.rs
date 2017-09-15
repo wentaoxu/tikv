@@ -24,15 +24,22 @@ extern crate rocksdb;
 #[cfg(test)]
 extern crate tempdir;
 extern crate rustc_serialize;
+extern crate grpcio as grpc;
 
-use std::{str, u64};
+use std::{process, str, u64};
+use std::sync::Arc;
+
 use clap::{App, Arg, SubCommand};
 use rustc_serialize::hex::{FromHex, ToHex};
 use protobuf::Message;
 use kvproto::raft_cmdpb::RaftCmdRequest;
 use kvproto::raft_serverpb::{PeerState, RaftApplyState, RaftLocalState, RegionLocalState};
 use kvproto::eraftpb::Entry;
+use kvproto::debugpb_grpc::DebugClient;
+use kvproto::debugpb::*;
 use rocksdb::{ReadOptions, SeekKey, DB};
+use grpc::{ChannelBuilder, Environment};
+
 use tikv::util::{self, escape, unescape};
 use tikv::util::codec::bytes::encode_bytes;
 use tikv::raftstore::store::keys;
@@ -52,6 +59,12 @@ fn main() {
                 .short("d")
                 .takes_value(true)
                 .help("set rocksdb path"),
+        )
+        .arg(
+            Arg::with_name("host")
+                .short("H")
+                .takes_value(true)
+                .help("set TiKV url"),
         )
         .arg(
             Arg::with_name("raftdb")
@@ -249,19 +262,44 @@ fn main() {
             return;
         }
     };
-    let db_path = matches.value_of("db").unwrap();
-    let db = util::rocksdb::open(db_path, ALL_CFS).unwrap();
-    let raft_db = if let Some(raftdb_path) = matches.value_of("raftdb") {
-        util::rocksdb::open(raftdb_path, &[CF_DEFAULT]).unwrap()
-    } else {
-        let raftdb_path = db_path.to_owned() + "../raft";
-        util::rocksdb::open(&raftdb_path, &[CF_DEFAULT]).unwrap()
+    let (remote, local) = (matches.value_of("host"), matches.value_of("db"));
+    let (remote, db, raft_db) = match (remote, local) {
+        (Some(_), Some(_)) => {
+            eprintln!("\"host\" and \"db\" can not be passed together!");
+            process::exit(1);
+        }
+        (None, None) => {
+            eprintln!("please pass \"host\" or \"db\"");
+            process::exit(1);
+        }
+        (None, Some(path)) => {
+            let db = util::rocksdb::open(path, ALL_CFS).unwrap();
+            let raft_db = if let Some(raftdb_path) = matches.value_of("raftdb") {
+                util::rocksdb::open(raftdb_path, &[CF_DEFAULT]).unwrap()
+            } else {
+                let raftdb_path = path.to_string() + "../raft";
+                util::rocksdb::open(&raftdb_path, &[CF_DEFAULT]).unwrap()
+            };
+            (None, Some(db), Some(raft_db))
+        }
+        (Some(remote), None) => (Some(remote), None, None),
     };
 
     if let Some(matches) = matches.subcommand_matches("print") {
         let cf_name = matches.value_of("cf").unwrap_or(CF_DEFAULT);
         let key = String::from(matches.value_of("key").unwrap());
-        dump_raw_value(db, cf_name, key);
+        if let Some(remote) = remote {
+            let env = Arc::new(Environment::new(1));
+            let channel = ChannelBuilder::new(env).connect(remote);
+            let client = DebugClient::new(channel);
+            let mut req = GetRequest::new();
+            req.set_cf(str_to_cf(cf_name));
+            req.set_key_encoded(unescape(&key));
+            let resp = client.get(req).unwrap();
+            println!("value: {}", escape(resp.get_value()));
+        } else {
+            dump_raw_value(db.unwrap(), cf_name, key);
+        }
     } else if let Some(matches) = matches.subcommand_matches("raft") {
         if let Some(matches) = matches.subcommand_matches("log") {
             let key = match matches.value_of("key") {
@@ -272,15 +310,20 @@ fn main() {
                 }
                 Some(k) => unescape(k),
             };
-            dump_raft_log_entry(raft_db, &key);
+            dump_raft_log_entry(raft_db.unwrap(), &key);
         } else if let Some(matches) = matches.subcommand_matches("region") {
             let skip_tombstone = matches.is_present("skip-tombstone");
             match matches.value_of("region") {
                 Some(id) => {
-                    dump_region_info(&db, &raft_db, id.parse().unwrap(), skip_tombstone);
+                    dump_region_info(
+                        &db.unwrap(),
+                        &raft_db.unwrap(),
+                        id.parse().unwrap(),
+                        skip_tombstone,
+                    );
                 }
                 None => {
-                    dump_all_region_info(&db, &raft_db, skip_tombstone);
+                    dump_all_region_info(&db.unwrap(), &raft_db.unwrap(), skip_tombstone);
                 }
             }
         } else {
@@ -290,9 +333,9 @@ fn main() {
         let cf_name = matches.value_of("cf");
         match matches.value_of("region") {
             Some(id) => {
-                dump_region_size(&db, id.parse().unwrap(), cf_name);
+                dump_region_size(&db.unwrap(), id.parse().unwrap(), cf_name);
             }
-            None => dump_all_region_size(&db, cf_name),
+            None => dump_all_region_size(&db.unwrap(), cf_name),
         }
     } else if let Some(matches) = matches.subcommand_matches("scan") {
         let from = String::from(matches.value_of("from").unwrap());
@@ -306,7 +349,7 @@ fn main() {
                 panic!("The region's start pos must greater than the end pos.")
             }
         }
-        dump_range(db, from, to, limit, cf_name, start_ts, commit_ts);
+        dump_range(db.unwrap(), from, to, limit, cf_name, start_ts, commit_ts);
     } else if let Some(matches) = matches.subcommand_matches("mvcc") {
         let cf_name = matches.value_of("cf").unwrap_or(CF_DEFAULT);
         let key = matches.value_of("key").unwrap();
@@ -316,15 +359,16 @@ fn main() {
         println!("You are searching Key {}: ", key);
         match cf_name {
             CF_DEFAULT => {
-                dump_mvcc_default(&db, key, key_encoded, start_ts);
+                dump_mvcc_default(&db.unwrap(), key, key_encoded, start_ts);
             }
             CF_LOCK => {
-                dump_mvcc_lock(&db, key, key_encoded, start_ts);
+                dump_mvcc_lock(&db.unwrap(), key, key_encoded, start_ts);
             }
             CF_WRITE => {
-                dump_mvcc_write(&db, key, key_encoded, start_ts, commit_ts);
+                dump_mvcc_write(&db.unwrap(), key, key_encoded, start_ts, commit_ts);
             }
             "all" => {
+                let db = db.unwrap();
                 dump_mvcc_default(&db, key, key_encoded, start_ts);
                 dump_mvcc_lock(&db, key, key_encoded, start_ts);
                 dump_mvcc_write(&db, key, key_encoded, start_ts, commit_ts);
@@ -338,7 +382,7 @@ fn main() {
         let region_id: u64 = matches.value_of("region").unwrap().parse().unwrap();
         let db_path2 = matches.value_of("to").unwrap();
         let db2 = util::rocksdb::open(db_path2, ALL_CFS).unwrap();
-        dump_diff(&db, &db2, region_id);
+        dump_diff(&db.unwrap(), &db2, region_id);
     } else {
         let _ = app.print_help();
     }
@@ -382,6 +426,16 @@ fn from_hex(key: &str) -> Vec<u8> {
         s.truncate(new_len);
     }
     s.as_str().from_hex().unwrap()
+}
+
+fn str_to_cf(cf: &str) -> CF {
+    match cf {
+        CF_DEFAULT => CF::DEFAULT,
+        CF_WRITE => CF::WRITE,
+        CF_LOCK => CF::LOCK,
+        CF_RAFT => CF::RAFT,
+        _ => panic!("invalid cf"),
+    }
 }
 
 pub fn gen_mvcc_iter<T: MvccDeserializable>(
