@@ -323,6 +323,12 @@ impl ReadableSize {
     }
 }
 
+impl From<u64> for ReadableSize {
+    fn from(size: u64) -> Self {
+        ReadableSize(size)
+    }
+}
+
 impl Div<u64> for ReadableSize {
     type Output = ReadableSize;
 
@@ -494,6 +500,12 @@ impl ReadableDuration {
 
     pub fn as_millis(&self) -> u64 {
         util::time::duration_to_ms(self.0)
+    }
+}
+
+impl From<Duration> for ReadableDuration {
+    fn from(dur: Duration) -> Self {
+        ReadableDuration(dur)
     }
 }
 
@@ -815,6 +827,8 @@ mod test {
         assert_eq!((ReadableSize::mb(2) / 2).0, MB);
         assert_eq!((ReadableSize::mb(1) / 2).0, 512 * KB);
         assert_eq!(ReadableSize::mb(2) / ReadableSize::kb(1), 2048);
+
+        assert_eq!(ReadableSize::from(1), ReadableSize(1));
     }
 
     #[test]
@@ -933,6 +947,10 @@ mod test {
         assert_eq!(dur.0, Duration::new(2 * 3600, 0));
         assert_eq!(dur.as_secs(), 7200);
         assert_eq!(dur.as_millis(), 7200000);
+        assert_eq!(
+            ReadableDuration::from(Duration::from_secs(1)),
+            ReadableSize(Duration::from_secs(1))
+        );
     }
 
     #[test]
