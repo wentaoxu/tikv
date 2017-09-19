@@ -16,6 +16,7 @@ use std::fmt::Debug;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::HashMap;
 use mio::Token;
 use grpc::{ClientStreamingSink, RequestStream, RpcContext, RpcStatus, RpcStatusCode, UnarySink};
 use futures::{future, Future, Stream};
@@ -451,6 +452,51 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
                         Ok(locks) => resp.set_locks(RepeatedField::from_vec(locks)),
                         Err(e) => resp.set_error(extract_key_error(&e)),
                     }
+                }
+                resp
+            })
+            .and_then(|res| sink.success(res).map_err(Error::from))
+            .map(|_| timer.observe_duration())
+            .map_err(move |e| {
+                debug!("{} failed: {:?}", label, e);
+                GRPC_MSG_FAIL_COUNTER.with_label_values(&[label]).inc();
+            });
+
+        ctx.spawn(future);
+    }
+
+    fn kv_batch_lock_resolve(
+        &self, 
+        ctx: RpcContext,
+        mut req: BatchLockResolveRequest, 
+        sink: UnarySink<BatchLockResolveResponse>,
+    ) {
+        let label = "kv_batch_lock_resolve";
+        let timer = GRPC_MSG_HISTOGRAM_VEC
+            .with_label_values(&[label])
+            .start_coarse_timer();
+
+        let mut temp_map = HashMap::new();
+        for txnstatus in req.take_txn2statusS().into_iter() {
+            temp_map.insert(txnstatus.txn, txnstatus.status);
+        }
+
+       let (cb, future) = make_callback();
+       let res = self.storage
+           .async_batch_lock_resolve(req.take_context(), temp_map, cb);
+       if let Err(e) = res {
+            self.send_fail_status(ctx, sink, Error::from(e), RpcStatusCode::ResourceExhausted);
+            return;
+       }  
+
+       let future = future
+            .map_err(Error::from)
+            .map(|v| {
+                let mut resp = BatchLockResolveResponse::new();
+                if let Some(err) = extract_region_error(&v) {
+                    resp.set_region_error(err);
+                } else if let Err(e) = v {
+                    resp.set_error(extract_key_error(&e));
                 }
                 resp
             })

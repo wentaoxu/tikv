@@ -627,6 +627,50 @@ fn process_read(
                 Err(e) => ProcessResult::Failed { err: e.into() },
             }
         }
+        // Batch lock resolve for read only
+        Command::BatchLockResolve {
+            ref ctx,
+            ref txn2status,
+            ref mut scan_key,
+            ..
+        } => {
+            let mut reader = MvccReader::new(
+                snapshot.as_ref(),
+                &mut statistics,
+                Some(ScanMode::Forward),
+                !ctx.get_not_fill_cache(),
+                None,
+                ctx.get_isolation_level(),
+            );
+            let res = reader
+                .scan_lock(
+                    scan_key.take(),
+                    |lock| txn2status.contains_key(&lock.ts),
+                    Some(RESOLVE_LOCK_BATCH_SIZE),
+                )
+                .map_err(Error::from)
+                .and_then(|(v, next_scan_key)| {
+                    let key_locks: Vec<_> = v.into_iter().map(|x| x).collect();
+                    KV_COMMAND_KEYREAD_HISTOGRAM_VEC
+                        .with_label_values(&[tag])
+                        .observe(key_locks.len() as f64);
+                    if key_locks.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(Command::BatchLockResolve {
+                            ctx: ctx.clone(),
+                            txn2status : txn2status.clone(),
+                            scan_key: next_scan_key,
+                            key_locks: key_locks,
+                        }))
+                    }
+                });
+            match res {
+                Ok(Some(cmd)) => ProcessResult::NextCommand { cmd: cmd },
+                Ok(None) => ProcessResult::Res,
+                Err(e) => ProcessResult::Failed { err: e.into() },
+            }
+        }
         // Collects garbage.
         Command::Gc {
             ref ctx,
@@ -924,7 +968,55 @@ fn process_write_impl(
                         keys: vec![],
                     },
                 };
-                (pr, txn.modifies(), rows)
+                (pr, txn.modifies() , rows)
+            }
+        }
+        Command::BatchLockResolve {
+            ref ctx,
+            ref txn2status,
+            ref mut scan_key,
+            ref key_locks,
+        } => {
+            let mut scan_key = scan_key.take();
+            let mut modifies : Vec<Modify> = vec![];
+            let rows = key_locks.len();
+            for key_lock in key_locks {
+                let mut txn = MvccTxn::new(
+                    snapshot,
+                    statistics,
+                    key_lock.1.ts,
+                    None,
+                    ctx.get_isolation_level(),
+                    !ctx.get_not_fill_cache(),
+                );
+                let status = txn2status.get(&(key_lock.1.ts));
+                let ts = match status {
+                    Some(ts) => *ts,
+                    None => panic!("txn status not found!"),
+                };
+                if ts > 0 {
+                    try!(txn.commit(&key_lock.0, ts));
+                } else {
+                    try!(txn.rollback(&key_lock.0));
+                }
+                if txn.write_size() >= MAX_TXN_WRITE_SIZE {
+                    scan_key = Some(key_lock.0.to_owned());
+                    modifies.append(&mut txn.modifies());
+                    break;
+                }
+            }
+            if scan_key.is_none() {
+                (ProcessResult::Res, modifies, rows)
+            } else {
+                let pr = ProcessResult::NextCommand {
+                    cmd: Command::BatchLockResolve {
+                        ctx: ctx.clone(),
+                        txn2status : txn2status.clone(),
+                        scan_key: scan_key.take(),
+                        key_locks: vec![],
+                    },
+                };
+                (pr, modifies, rows)
             }
         }
         Command::Gc {

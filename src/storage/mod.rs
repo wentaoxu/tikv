@@ -22,6 +22,7 @@ use std::u64;
 use kvproto::kvrpcpb::{CommandPri, LockInfo};
 use kvproto::errorpb;
 use self::metrics::*;
+use std::collections::HashMap;
 
 pub mod engine;
 pub mod mvcc;
@@ -34,6 +35,7 @@ pub use self::config::{Config, DEFAULT_DATA_DIR, DEFAULT_ROCKSDB_SUB_DIR};
 pub use self::engine::{new_local_engine, CFStatistics, Cursor, Engine, Error as EngineError,
                        Modify, ScanMode, Snapshot, Statistics, StatisticsSummary, TEMP_DIR};
 pub use self::engine::raftkv::RaftKv;
+use self::mvcc::Lock;
 pub use self::txn::{Msg, Scheduler, SnapshotStore, StoreScanner};
 pub use self::types::{make_key, Key, KvPair, MvccInfo, Value};
 pub type Callback<T> = Box<FnBox(Result<T>) + Send>;
@@ -134,6 +136,12 @@ pub enum Command {
         commit_ts: Option<u64>,
         scan_key: Option<Key>,
         keys: Vec<Key>,
+    },
+    BatchLockResolve {
+        ctx: Context,
+        txn2status: HashMap<u64, u64>,
+        scan_key: Option<Key>,
+        key_locks: Vec<(Key, Lock)>,
     },
     Gc {
         ctx: Context,
@@ -252,6 +260,11 @@ impl Display for Command {
                 commit_ts,
                 ctx
             ),
+            Command::BatchLockResolve {
+                ref ctx,
+                ref txn2status,
+                ..
+            } => write!(f, "kv::batchlockresolve"),
             Command::Gc {
                 ref ctx,
                 safe_point,
@@ -329,6 +342,7 @@ impl Command {
             Command::MvccByStartTs { .. } => true,
             Command::ResolveLock { ref keys, .. } |
             Command::Gc { ref keys, .. } => keys.is_empty(),
+            Command::BatchLockResolve { ref key_locks, .. } => key_locks.is_empty(),
             _ => false,
         }
     }
@@ -360,6 +374,7 @@ impl Command {
             Command::Rollback { .. } => "rollback",
             Command::ScanLock { .. } => "scan_lock",
             Command::ResolveLock { .. } => "resolve_lock",
+            Command::BatchLockResolve { .. } => "batch_lock_resolve",
             Command::Gc { .. } => CMD_TAG_GC,
             Command::RawGet { .. } => "raw_get",
             Command::RawScan { .. } => "raw_scan",
@@ -383,6 +398,7 @@ impl Command {
             Command::Commit { lock_ts, .. } => lock_ts,
             Command::ScanLock { max_ts, .. } => max_ts,
             Command::Gc { safe_point, .. } => safe_point,
+            Command::BatchLockResolve { .. } |
             Command::RawGet { .. } |
             Command::RawScan { .. } |
             Command::DeleteRange { .. } |
@@ -402,6 +418,7 @@ impl Command {
             Command::Rollback { ref ctx, .. } |
             Command::ScanLock { ref ctx, .. } |
             Command::ResolveLock { ref ctx, .. } |
+            Command::BatchLockResolve {ref ctx, .. } |
             Command::Gc { ref ctx, .. } |
             Command::RawGet { ref ctx, .. } |
             Command::RawScan { ref ctx, .. } |
@@ -423,6 +440,7 @@ impl Command {
             Command::Rollback { ref mut ctx, .. } |
             Command::ScanLock { ref mut ctx, .. } |
             Command::ResolveLock { ref mut ctx, .. } |
+            Command::BatchLockResolve {ref mut ctx, .. } |
             Command::Gc { ref mut ctx, .. } |
             Command::RawGet { ref mut ctx, .. } |
             Command::RawScan { ref mut ctx, .. } |
@@ -756,6 +774,24 @@ impl Storage {
             commit_ts: commit_ts,
             scan_key: None,
             keys: vec![],
+        };
+        let tag = cmd.tag();
+        try!(self.send(cmd, StorageCb::Boolean(callback)));
+        KV_COMMAND_COUNTER_VEC.with_label_values(&[tag]).inc();
+        Ok(())
+    }
+
+    pub fn async_batch_lock_resolve(
+        &self,
+        ctx: Context,
+        txn2status: HashMap<u64, u64>,
+        callback: Callback<()>,
+    ) -> Result<()> {
+        let cmd = Command::BatchLockResolve {
+            ctx: ctx,
+            txn2status: txn2status,
+            scan_key: None,
+            key_locks: vec![],
         };
         let tag = cmd.tag();
         try!(self.send(cmd, StorageCb::Boolean(callback)));
