@@ -255,30 +255,28 @@ impl DebugExecutor {
         }
     }
 
-    fn tombstone(&self, region: u64, pd_url: &str) {
+    fn tombstone(&self, region: u64, endpoints: Vec<String>) {
         match *self {
             DebugExecutor::Remote(_) => {
                 eprintln!("This command is only for local mode");
                 process::exit(-1);
             }
-            DebugExecutor::Local(ref debugger) => {
-                let endpoints = [pd_url.to_owned()];
-                if let Some(mut meta_region) = RpcClient::new(&endpoints)
+            DebugExecutor::Local(ref debugger) => if let Some(mut meta_region) =
+                RpcClient::new(&endpoints)
                     .unwrap_or_else(Self::report_and_exit)
                     .get_region_by_id(region)
                     .wait()
                     .unwrap_or_else(Self::report_and_exit)
-                {
-                    let epoch = meta_region.take_region_epoch();
-                    let peers = meta_region.take_peers();
-                    debugger
-                        .set_region_tombstone(region, epoch, peers)
-                        .unwrap_or_else(Self::report_and_exit);
-                } else {
-                    eprintln!("no such region in pd: {}", region);
-                    process::exit(-1);
-                }
-            }
+            {
+                let epoch = meta_region.take_region_epoch();
+                let peers = meta_region.take_peers();
+                debugger
+                    .set_region_tombstone(region, epoch, peers)
+                    .unwrap_or_else(Self::report_and_exit);
+            } else {
+                eprintln!("no such region in pd: {}", region);
+                process::exit(-1);
+            },
         }
     }
 
@@ -657,6 +655,10 @@ fn main() {
                     Arg::with_name("pd")
                         .short("p")
                         .takes_value(true)
+                        .multiple(true)
+                        .use_delimiter(true)
+                        .require_delimiter(true)
+                        .value_delimiter(",")
                         .help("the pd url"),
                 ),
         );
@@ -745,8 +747,12 @@ fn main() {
         debug_executor.compact(db_type, cf, from_key, to_key);
     } else if let Some(matches) = matches.subcommand_matches("tombstone") {
         let region = matches.value_of("region").unwrap().parse().unwrap();
-        let pd_url = matches.value_of("pd").unwrap();
-        debug_executor.tombstone(region, pd_url);
+        let pd_urls = matches
+            .values_of("pd")
+            .unwrap()
+            .map(|u| u.to_owned())
+            .collect();
+        debug_executor.tombstone(region, pd_urls);
     } else {
         let _ = app.print_help();
     }
