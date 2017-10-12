@@ -18,13 +18,13 @@ use std::sync::Arc;
 use protobuf::RepeatedField;
 
 use rocksdb::{Kv, SeekKey, DB};
+use kvproto::metapb::{Peer, RegionEpoch};
 use kvproto::kvrpcpb::{LockInfo, MvccInfo, Op, ValueInfo, WriteInfo};
 use kvproto::debugpb::DB as DBType;
 use kvproto::eraftpb::Entry;
 use kvproto::raft_serverpb::*;
 
 use raftstore::store::{keys, Engines, Iterable, Peekable};
-use raftstore::store::util::remove_peer;
 use raftstore::store::engine::{IterOption, Mutable};
 use storage::{is_short_value, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
 use storage::types::{truncate_ts, Key};
@@ -221,17 +221,19 @@ impl Debugger {
     }
 
     /// Set a region to tombstone by manual.
-    pub fn tombstone_region(&self, region: u64, conf_ver: u64) -> Result<()> {
+    pub fn set_region_tombstone(
+        &self,
+        region: u64,
+        epoch: RegionEpoch,
+        peers: RepeatedField<Peer>,
+    ) -> Result<()> {
         let db = &self.engines.kv_engine;
         let key = keys::region_state_key(region);
         match box_try!(db.get_msg_cf::<RegionLocalState>(CF_RAFT, &key)) {
             Some(mut region_state) => {
                 region_state.set_state(PeerState::Tombstone);
-                remove_peer(region_state.mut_region(), self.get_kv_store_id()?);
-                region_state
-                    .mut_region()
-                    .mut_region_epoch()
-                    .set_conf_ver(conf_ver);
+                region_state.mut_region().set_region_epoch(epoch);
+                region_state.mut_region().set_peers(peers);
                 if let Some(cf_raft) = db.cf_handle(CF_RAFT) {
                     box_try!(db.put_msg_cf(cf_raft, &key, &region_state));
                     Ok(())
@@ -240,15 +242,6 @@ impl Debugger {
                 }
             }
             None => Err(box_err!("not a valid region")),
-        }
-    }
-
-    fn get_kv_store_id(&self) -> Result<u64> {
-        let db = &self.engines.kv_engine;
-        let key = keys::store_ident_key();
-        match box_try!(db.get_msg::<StoreIdent>(&key)) {
-            Some(ident) => Ok(ident.get_store_id()),
-            None => Err(box_err!("can't get kv store id")),
         }
     }
 }

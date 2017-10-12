@@ -51,6 +51,7 @@ use tikv::util::{self, escape, unescape};
 use tikv::raftstore::store::{keys, Engines};
 use tikv::raftstore::store::debug::{Debugger, RegionInfo};
 use tikv::storage::{ALL_CFS, CF_DEFAULT, CF_LOCK, CF_RAFT, CF_WRITE};
+use tikv::pd::{PdClient, RpcClient};
 
 enum DebugExecutor {
     Remote(DebugClient),
@@ -254,15 +255,30 @@ impl DebugExecutor {
         }
     }
 
-    fn tombstone(&self, region: u64, conf_ver: u64) {
+    fn tombstone(&self, region: u64, pd_url: &str) {
         match *self {
             DebugExecutor::Remote(_) => {
                 eprintln!("This command is only for local mode");
                 process::exit(-1);
             }
-            DebugExecutor::Local(ref debugger) => debugger
-                .tombstone_region(region, conf_ver)
-                .unwrap_or_else(Self::report_and_exit),
+            DebugExecutor::Local(ref debugger) => {
+                let endpoints = [pd_url.to_owned()];
+                if let Some(mut meta_region) = RpcClient::new(&endpoints)
+                    .unwrap_or_else(Self::report_and_exit)
+                    .get_region_by_id(region)
+                    .wait()
+                    .unwrap_or_else(Self::report_and_exit)
+                {
+                    let epoch = meta_region.take_region_epoch();
+                    let peers = meta_region.take_peers();
+                    debugger
+                        .set_region_tombstone(region, epoch, peers)
+                        .unwrap_or_else(Self::report_and_exit);
+                } else {
+                    eprintln!("no such region in pd: {}", region);
+                    process::exit(-1);
+                }
+            }
         }
     }
 
@@ -638,10 +654,10 @@ fn main() {
                         .help("the target region"),
                 )
                 .arg(
-                    Arg::with_name("conf_ver")
-                        .short("v")
+                    Arg::with_name("pd")
+                        .short("p")
                         .takes_value(true)
-                        .help("the conf_ver set to the region"),
+                        .help("the pd url"),
                 ),
         );
     let matches = app.clone().get_matches();
@@ -729,8 +745,8 @@ fn main() {
         debug_executor.compact(db_type, cf, from_key, to_key);
     } else if let Some(matches) = matches.subcommand_matches("tombstone") {
         let region = matches.value_of("region").unwrap().parse().unwrap();
-        let conf_ver = matches.value_of("conf_ver").unwrap().parse().unwrap();
-        debug_executor.tombstone(region, conf_ver);
+        let pd_url = matches.value_of("pd").unwrap();
+        debug_executor.tombstone(region, pd_url);
     } else {
         let _ = app.print_help();
     }
