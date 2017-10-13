@@ -634,6 +634,7 @@ fn process_read(
             ref mut scan_key,
             ..
         } => {
+	    info!("BatchLockResolve Invoked");
             let mut reader = MvccReader::new(
                 snapshot.as_ref(),
                 &mut statistics,
@@ -977,6 +978,7 @@ fn process_write_impl(
             ref mut scan_key,
             ref key_locks,
         } => {
+	    info!("Write BatchLockResolve Invoked");
             let mut scan_key = scan_key.take();
             let mut modifies : Vec<Modify> = vec![];
             let rows = key_locks.len();
@@ -995,13 +997,23 @@ fn process_write_impl(
                     None => panic!("txn status not found!"),
                 };
                 if ts > 0 {
-                    try!(txn.commit(&key_lock.0, ts));
+		    info!("we will commit");
+		    if let Err(e) = txn.commit(&key_lock.0, ts) {
+			info!("a commit tx failed");
+			return Err(Error::from(e))
+		    }
                 } else {
-                    try!(txn.rollback(&key_lock.0));
+		    info!("we will abort");
+		    if let Err(e) = txn.rollback(&key_lock.0) {
+			info!("a rollback tx failed");
+			return Err(Error::from(e))
+		    }
                 }
-                if txn.write_size() >= MAX_TXN_WRITE_SIZE {
+	        info!("commit or abort successeds");
+		modifies.append(&mut txn.modifies());
+                if modifies.len() >= MAX_TXN_WRITE_SIZE {
                     scan_key = Some(key_lock.0.to_owned());
-                    modifies.append(&mut txn.modifies());
+                    //modifies.append(&mut txn.modifies());
                     break;
                 }
             }
@@ -1456,10 +1468,12 @@ impl Scheduler {
         to_be_write: Vec<Modify>,
         rows: usize,
     ) {
+	info!("we are going to write");
         SCHED_STAGE_COUNTER_VEC
             .with_label_values(&[self.get_ctx_tag(cid), "write"])
             .inc();
         if to_be_write.is_empty() {
+	    info!("modifies is empty");
             return self.on_write_finished(cid, pr, Ok(()));
         }
         let engine_cb = make_engine_cb(cmd.tag(), cid, pr, self.schedch.clone(), rows);
@@ -1479,6 +1493,7 @@ impl Scheduler {
             .with_label_values(&[self.get_ctx_tag(cid), "write_finish"])
             .inc();
         debug!("write finished for command, cid={}", cid);
+        info!("write finished for command, cid={}", cid);
         let mut ctx = self.remove_ctx(cid);
         let cb = ctx.callback.take().unwrap();
         let pr = match result {

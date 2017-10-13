@@ -262,7 +262,6 @@ impl Display for Command {
             ),
             Command::BatchLockResolve {
                 ref ctx,
-                ref txn2status,
                 ..
             } => write!(f, "kv::batchlockresolve"),
             Command::Gc {
