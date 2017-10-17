@@ -1511,9 +1511,9 @@ pub fn gen_command_lock(latches: &Latches, cmd: &Command) -> Lock {
             let keys: Vec<&Key> = mutations.iter().map(|x| x.key()).collect();
             latches.gen_lock(&keys)
         }
-        Command::Commit { ref keys, .. } |
-        Command::Rollback { ref keys, .. } |
         Command::ResolveLock { ref key_locks, .. } => latches.gen_lock(key_locks.map(|x| x.0).collect::<Vec<Key>>()),
+        Command::Commit { ref keys, .. } |
+        Command::Rollback { ref keys, .. } => latches.gen_lock(keys),
         Command::Cleanup { ref key, .. } => latches.gen_lock(&[key]),
         _ => Lock::new(vec![]),
     }
