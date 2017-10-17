@@ -28,6 +28,12 @@ lazy_static! {
             &["type", "stage"]
         ).unwrap();
 
+    pub static ref SCHED_WRITING_KV_GAUGE: Gauge =
+        register_gauge!(
+            "tikv_scheduler_writing_kv_total",
+            "Total number of writing kv."
+        ).unwrap();
+
     pub static ref SCHED_CONTEX_GAUGE: Gauge =
         register_gauge!(
             "tikv_scheduler_contex_total",
@@ -81,7 +87,7 @@ lazy_static! {
 
     pub static ref KV_COMMAND_SCAN_DETAILS: CounterVec =
         register_counter_vec!(
-            "tikv_scheudler_kv_scan_details",
+            "tikv_scheduler_kv_scan_details",
             "Bucketed counter of kv keys scan details for each cf",
             &["req","cf","tag"]
         ).unwrap();

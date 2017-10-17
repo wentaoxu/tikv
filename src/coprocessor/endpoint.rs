@@ -15,8 +15,10 @@ use std::usize;
 use std::time::Duration;
 use std::rc::Rc;
 use std::fmt::{self, Debug, Display, Formatter};
+use std::mem;
 
 use tipb::select::{self, Chunk, DAGRequest, SelectRequest};
+use tipb::analyze::{AnalyzeReq, AnalyzeType};
 use tipb::executor::ExecType;
 use tipb::schema::ColumnInfo;
 use protobuf::Message as PbMsg;
@@ -25,24 +27,27 @@ use kvproto::errorpb::{self, ServerIsBusy};
 use kvproto::kvrpcpb::{CommandPri, IsolationLevel};
 
 use util::time::{duration_to_sec, Instant};
-use util::worker::{BatchRunnable, Scheduler};
+use util::worker::{BatchRunnable, FutureScheduler, Scheduler};
 use util::collections::HashMap;
-use util::threadpool::{Context, ThreadPool, ThreadPoolBuilder};
+use util::threadpool::{Context, ContextFactory, ThreadPool, ThreadPoolBuilder};
 use server::{Config, OnResponse};
-use storage::{self, engine, Engine, Snapshot, Statistics, StatisticsSummary};
+use storage::{self, engine, Engine, FlowStatistics, Snapshot, Statistics, StatisticsSummary};
 use storage::engine::Error as EngineError;
+use pd::PdTask;
 
 use super::codec::mysql;
 use super::codec::datum::Datum;
 use super::select::select::SelectContext;
 use super::select::xeval::EvalContext;
 use super::dag::DAGContext;
+use super::statistics::analyze::AnalyzeContext;
 use super::metrics::*;
 use super::{Error, Result};
 
 pub const REQ_TYPE_SELECT: i64 = 101;
 pub const REQ_TYPE_INDEX: i64 = 102;
 pub const REQ_TYPE_DAG: i64 = 103;
+pub const REQ_TYPE_ANALYZE: i64 = 104;
 pub const BATCH_ROW_COUNT: usize = 64;
 
 // If a request has been handled for more than 60 seconds, the client should
@@ -70,10 +75,32 @@ pub struct Host {
     max_running_task_count: usize,
 }
 
-#[derive(Default)]
+pub type CopRequestStatistics = HashMap<u64, FlowStatistics>;
+
+pub trait CopSender: Send + Clone {
+    fn send(&self, CopRequestStatistics) -> Result<()>;
+}
+
+struct CopContextFactory {
+    sender: FutureScheduler<PdTask>,
+}
+
+impl ContextFactory<CopContext> for CopContextFactory {
+    fn create(&self) -> CopContext {
+        CopContext {
+            sender: self.sender.clone(),
+            select_stats: Default::default(),
+            index_stats: Default::default(),
+            request_stats: HashMap::default(),
+        }
+    }
+}
+
 struct CopContext {
     select_stats: StatisticsSummary,
     index_stats: StatisticsSummary,
+    request_stats: CopRequestStatistics,
+    sender: FutureScheduler<PdTask>,
 }
 
 impl CopContext {
@@ -90,6 +117,14 @@ impl CopContext {
                 &mut self.select_stats
             }
         }
+    }
+
+    fn add_statistics_by_region(&mut self, region_id: u64, stats: &Statistics) {
+        let flow_stats = self.request_stats
+            .entry(region_id)
+            .or_insert_with(FlowStatistics::default);
+        flow_stats.add(&stats.write.flow_stats);
+        flow_stats.add(&stats.data.flow_stats);
     }
 }
 
@@ -110,26 +145,45 @@ impl Context for CopContext {
             }
             *this_statistics = Default::default();
         }
+        if !self.request_stats.is_empty() {
+            let mut to_send_stats = HashMap::default();
+            mem::swap(&mut to_send_stats, &mut self.request_stats);
+            if let Err(e) = self.sender.schedule(PdTask::ReadStats {
+                read_stats: to_send_stats,
+            }) {
+                error!("send coprocessor statistics: {:?}", e);
+            };
+        }
+
     }
 }
 
 impl Host {
-    pub fn new(engine: Box<Engine>, scheduler: Scheduler<Task>, cfg: &Config) -> Host {
+    pub fn new(
+        engine: Box<Engine>,
+        scheduler: Scheduler<Task>,
+        cfg: &Config,
+        r: FutureScheduler<PdTask>,
+    ) -> Host {
         Host {
             engine: engine,
             sched: scheduler,
             reqs: HashMap::default(),
             last_req_id: 0,
             max_running_task_count: cfg.end_point_max_tasks,
-            pool: ThreadPoolBuilder::with_default_factory(thd_name!("endpoint-normal-pool"))
-                .thread_count(cfg.end_point_concurrency)
-                .build(),
-            low_priority_pool: ThreadPoolBuilder::with_default_factory(
-                thd_name!("endpoint-low-pool"),
+            pool: ThreadPoolBuilder::new(
+                thd_name!("endpoint-normal-pool"),
+                CopContextFactory { sender: r.clone() },
             ).thread_count(cfg.end_point_concurrency)
                 .build(),
-            high_priority_pool: ThreadPoolBuilder::with_default_factory(
+            low_priority_pool: ThreadPoolBuilder::new(
+                thd_name!("endpoint-low-pool"),
+                CopContextFactory { sender: r.clone() },
+            ).thread_count(cfg.end_point_concurrency)
+                .build(),
+            high_priority_pool: ThreadPoolBuilder::new(
                 thd_name!("endpoint-high-pool"),
+                CopContextFactory { sender: r.clone() },
             ).thread_count(cfg.end_point_concurrency)
                 .build(),
         }
@@ -171,8 +225,10 @@ impl Host {
                 CommandPri::Normal => &mut self.pool,
             };
             pool.execute(move |ctx: &mut CopContext| {
+                let region_id = req.req.get_context().get_region_id();
                 let stats = end_point.handle_request(req);
                 ctx.add_statistics(type_str, &stats);
+                ctx.add_statistics_by_region(region_id, &stats);
                 COPR_PENDING_REQS
                     .with_label_values(&[type_str, pri_str])
                     .dec();
@@ -202,6 +258,7 @@ impl Display for Task {
 enum CopRequest {
     Select(SelectRequest),
     DAG(DAGRequest),
+    Analyze(AnalyzeReq),
 }
 
 pub struct ReqContext {
@@ -277,6 +334,19 @@ impl RequestTask {
                     Ok(CopRequest::DAG(dag))
                 }
             }
+            REQ_TYPE_ANALYZE => {
+                let mut analyze = AnalyzeReq::new();
+                if let Err(e) = analyze.merge_from_bytes(req.get_data()) {
+                    Err(box_err!(e))
+                } else {
+                    start_ts = Some(analyze.get_start_ts());
+                    if analyze.get_tp() == AnalyzeType::TypeColumn {
+                        table_scan = true;
+                    }
+                    Ok(CopRequest::Analyze(analyze))
+                }
+            }
+
             _ => Err(box_err!("unsupported tp {}", tp)),
         };
         let req_ctx = ReqContext {
@@ -471,6 +541,12 @@ impl BatchRunnable<Task> for Host {
         if let Err(e) = self.pool.stop() {
             warn!("Stop threadpool failed with {:?}", e);
         }
+        if let Err(e) = self.low_priority_pool.stop() {
+            warn!("Stop threadpool failed with {:?}", e);
+        }
+        if let Err(e) = self.high_priority_pool.stop() {
+            warn!("Stop threadpool failed with {:?}", e);
+        }
     }
 }
 
@@ -551,6 +627,7 @@ impl TiDbEndPoint {
         let resp = match t.cop_req.take().unwrap() {
             Ok(CopRequest::Select(sel)) => self.handle_select(sel, &mut t),
             Ok(CopRequest::DAG(dag)) => self.handle_dag(dag, &mut t),
+            Ok(CopRequest::Analyze(analyze)) => self.handle_analyze(analyze, &mut t),
             Err(err) => Err(err),
         };
         match resp {
@@ -560,12 +637,7 @@ impl TiDbEndPoint {
     }
 
     fn handle_select(&self, sel: SelectRequest, t: &mut RequestTask) -> Result<Response> {
-        let ctx = try!(SelectContext::new(
-            sel,
-            self.snap.as_ref(),
-            &mut t.statistics,
-            &t.ctx
-        ));
+        let ctx = SelectContext::new(sel, self.snap.as_ref(), &mut t.statistics, &t.ctx)?;
         let range = t.req.get_ranges().to_vec();
         ctx.handle_request(range)
     }
@@ -578,6 +650,18 @@ impl TiDbEndPoint {
         )));
         let ctx = DAGContext::new(dag, ranges, self.snap.as_ref(), eval_ctx.clone(), &t.ctx);
         ctx.handle_request(&mut t.statistics)
+    }
+
+    pub fn handle_analyze(&self, analyze: AnalyzeReq, t: &mut RequestTask) -> Result<Response> {
+        let ranges = t.req.get_ranges().to_vec();
+        let ctx = AnalyzeContext::new(
+            analyze,
+            ranges,
+            self.snap.as_ref(),
+            &mut t.statistics,
+            &t.ctx,
+        );
+        ctx.handle_request()
     }
 }
 
@@ -655,17 +739,16 @@ pub fn get_req_pri_str(pri: CommandPri) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use storage::engine::{self, TEMP_DIR};
     use std::sync::*;
     use std::thread;
     use std::time::Duration;
 
     use kvproto::coprocessor::Request;
 
-    use storage::engine::{self, TEMP_DIR};
-    use util::worker::Worker;
+    use util::worker::{FutureWorker, Worker};
     use util::time::Instant;
-
-    use super::*;
 
     #[test]
     fn test_get_reg_scan_tag() {
@@ -686,7 +769,8 @@ mod tests {
         let engine = engine::new_local_engine(TEMP_DIR, &[]).unwrap();
         let mut cfg = Config::default();
         cfg.end_point_concurrency = 1;
-        let end_point = Host::new(engine, worker.scheduler(), &cfg);
+        let pd_worker = FutureWorker::new("test-pd-worker");
+        let end_point = Host::new(engine, worker.scheduler(), &cfg, pd_worker.scheduler());
         worker.start_batch(end_point, 30).unwrap();
         let (tx, rx) = mpsc::channel();
         let mut task = RequestTask::new(Request::new(), box move |msg| { tx.send(msg).unwrap(); });
@@ -703,7 +787,8 @@ mod tests {
         let engine = engine::new_local_engine(TEMP_DIR, &[]).unwrap();
         let mut cfg = Config::default();
         cfg.end_point_concurrency = 1;
-        let mut end_point = Host::new(engine, worker.scheduler(), &cfg);
+        let pd_worker = FutureWorker::new("test-pd-worker");
+        let mut end_point = Host::new(engine, worker.scheduler(), &cfg, pd_worker.scheduler());
         end_point.max_running_task_count = 3;
         worker.start_batch(end_point, 30).unwrap();
         let (tx, rx) = mpsc::channel();

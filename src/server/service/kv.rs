@@ -476,18 +476,15 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             .with_label_values(&[label])
             .start_coarse_timer();
 
-        let mut txn_2_status = HashMap::new();
+        let mut txn_2_status : HashMap<u64, u64> = HashMap::new();
 
         let start_ts = req.get_start_version();
         if start_ts > 0 {
-            let commit_ts = match req.get_commit_version() {
-                0 => None,
-                x => Some(x),
-            };
+            let commit_ts = req.get_commit_version();
             txn_2_status.insert(start_ts, commit_ts); 
         } else {
-            for txninfo in req.take_txn_infos().into_iter() {
-                txn_2_status.insert(txninfo.txn, txninfo.status);
+            for temp in req.take_txn_infos().into_iter() {
+                txn_2_status.insert(temp.txn, temp.status);
             }
         }
 
@@ -955,7 +952,7 @@ impl<T: RaftStoreRouter + 'static> tikvpb_grpc::Tikv for Service<T> {
             region_id: req.get_context().get_region_id(),
             region_epoch: req.take_context().take_region_epoch(),
             split_key: Key::from_raw(req.get_split_key()).encoded().clone(),
-            callback: cb,
+            callback: Some(cb),
         };
 
         if let Err(e) = self.ch.try_send(req) {

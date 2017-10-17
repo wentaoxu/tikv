@@ -15,7 +15,7 @@ use std::rc::Rc;
 
 use tipb::executor::{ExecType, Executor};
 use tipb::schema::ColumnInfo;
-use tipb::select::{DAGRequest, RowMeta, SelectResponse};
+use tipb::select::{DAGRequest, SelectResponse};
 use kvproto::coprocessor::{KeyRange, Response};
 use protobuf::{Message as PbMsg, RepeatedField};
 
@@ -59,29 +59,21 @@ impl<'s> DAGContext<'s> {
     }
 
     pub fn handle_request(mut self, statistics: &'s mut Statistics) -> Result<Response> {
-        try!(self.validate_dag());
-        let mut exec = try!(self.build_dag(statistics));
+        self.validate_dag()?;
+        let mut exec = self.build_dag(statistics)?;
         let mut chunks = vec![];
         loop {
             match exec.next() {
                 Ok(Some(row)) => {
-                    try!(self.req_ctx.check_if_outdated());
+                    self.req_ctx.check_if_outdated()?;
                     let chunk = get_chunk(&mut chunks);
-                    let length = chunk.get_rows_data().len();
                     if self.has_aggr {
                         chunk.mut_rows_data().extend_from_slice(&row.data.value);
                     } else {
-                        let value = try!(inflate_cols(
-                            &row,
-                            &self.columns,
-                            self.req.get_output_offsets()
-                        ));
+                        let value =
+                            inflate_cols(&row, &self.columns, self.req.get_output_offsets())?;
                         chunk.mut_rows_data().extend_from_slice(&value);
                     }
-                    let mut meta = RowMeta::new();
-                    meta.set_handle(row.handle);
-                    meta.set_length((chunk.get_rows_data().len() - length) as i64);
-                    chunk.mut_rows_meta().push(meta);
                 }
                 Ok(None) => {
                     let mut resp = Response::new();
@@ -107,11 +99,9 @@ impl<'s> DAGContext<'s> {
 
     fn validate_dag(&mut self) -> Result<()> {
         let execs = self.req.get_executors();
-        let first = try!(
-            execs
-                .first()
-                .ok_or_else(|| Error::Other(box_err!("has no executor")))
-        );
+        let first = execs
+            .first()
+            .ok_or_else(|| Error::Other(box_err!("has no executor")))?;
         // check whether first exec is *scan and get the column info
         match first.get_tp() {
             ExecType::TypeTableScan => {
@@ -154,7 +144,7 @@ impl<'s> DAGContext<'s> {
 
         match first.get_tp() {
             ExecType::TypeTableScan => Box::new(TableScanExecutor::new(
-                first.take_tbl_scan(),
+                first.get_tbl_scan(),
                 self.ranges.clone(),
                 store,
                 statistics,
@@ -177,24 +167,24 @@ impl<'s> DAGContext<'s> {
                 ExecType::TypeTableScan | ExecType::TypeIndexScan => {
                     return Err(box_err!("got too much *scan exec, should be only one"))
                 }
-                ExecType::TypeSelection => Box::new(try!(SelectionExecutor::new(
+                ExecType::TypeSelection => Box::new(SelectionExecutor::new(
                     exec.take_selection(),
                     self.eval_ctx.clone(),
                     self.columns.clone(),
-                    src
-                ))),
-                ExecType::TypeAggregation => Box::new(try!(AggregationExecutor::new(
+                    src,
+                )?),
+                ExecType::TypeAggregation => Box::new(AggregationExecutor::new(
                     exec.take_aggregation(),
                     self.eval_ctx.clone(),
                     self.columns.clone(),
-                    src
-                ))),
-                ExecType::TypeTopN => Box::new(try!(TopNExecutor::new(
+                    src,
+                )?),
+                ExecType::TypeTopN => Box::new(TopNExecutor::new(
                     exec.take_topN(),
                     self.eval_ctx.clone(),
                     self.columns.clone(),
-                    src
-                ))),
+                    src,
+                )?),
                 ExecType::TypeLimit => Box::new(LimitExecutor::new(exec.take_limit(), src)),
             };
             src = curr;

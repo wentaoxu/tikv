@@ -119,7 +119,7 @@ impl Default for Config {
             split_region_check_tick_interval: ReadableDuration::secs(10),
             region_max_size: split_size / 2 * 3,
             region_split_size: split_size,
-            region_split_check_diff: split_size / 8,
+            region_split_check_diff: split_size / 16,
             // Disable manual compaction by default.
             region_compact_check_interval: ReadableDuration::secs(0),
             region_compact_delete_keys_count: 1_000_000,

@@ -179,6 +179,7 @@ fn execute_callback(callback: StorageCb, pr: ProcessResult) {
 pub struct RunningCtx {
     cid: u64,
     cmd: Option<Command>,
+    kv_count: usize,
     lock: Lock,
     callback: Option<StorageCb>,
     tag: &'static str,
@@ -195,9 +196,11 @@ impl RunningCtx {
         let tag = cmd.tag();
         let ts = cmd.ts();
         let region_id = cmd.get_context().get_region_id();
+        let kv_count = cmd.kv_count();
         RunningCtx {
             cid: cid,
             cmd: Some(cmd),
+            kv_count: kv_count,
             lock: lock,
             callback: Some(cb),
             tag: tag,
@@ -305,6 +308,8 @@ pub struct Scheduler {
     // write concurrency control
     latches: Latches,
 
+    // TODO: Dynamically calculate this value according to processing
+    // speed of recent write requests.
     sched_too_busy_threshold: usize,
 
     // worker pool
@@ -316,7 +321,7 @@ pub struct Scheduler {
     has_gc_command: bool,
 
     // used to control write flow
-    running_write_count: usize,
+    running_write_kv_count: usize,
 }
 
 // Make clippy happy.
@@ -329,9 +334,9 @@ fn find_mvcc_infos_by_key(
 ) -> Result<MultipleReturnValue> {
     let mut writes = vec![];
     let mut values = vec![];
-    let lock = try!(reader.load_lock(key));
+    let lock = reader.load_lock(key)?;
     loop {
-        let opt = try!(reader.seek_write(key, ts));
+        let opt = reader.seek_write(key, ts)?;
         let short_value: Option<Value>;
         match opt {
             Some((commit_ts, mut write)) => {
@@ -350,7 +355,7 @@ fn find_mvcc_infos_by_key(
             values.push((write.start_ts, true, v));
         }
     }
-    for (ts, v) in try!(reader.scan_values_in_default(key)) {
+    for (ts, v) in reader.scan_values_in_default(key)? {
         values.push((ts, false, v));
     }
     Ok((lock, writes, values))
@@ -383,7 +388,7 @@ impl Scheduler {
                 thd_name!("sched-high-pri-pool"),
             ).build(),
             has_gc_command: false,
-            running_write_count: 0,
+            running_write_kv_count: 0,
         }
     }
 }
@@ -567,7 +572,7 @@ fn process_read(
                         let mut lock_info = LockInfo::new();
                         lock_info.set_primary_lock(lock.primary);
                         lock_info.set_lock_version(lock.ts);
-                        lock_info.set_key(try!(key.raw()));
+                        lock_info.set_key(key.raw()?);
                         locks.push(lock_info);
                     }
                     KV_COMMAND_KEYREAD_HISTOGRAM_VEC
@@ -722,8 +727,8 @@ fn process_rawscan(
     limit: usize,
     stats: &mut Statistics,
 ) -> Result<Vec<StorageResult<KvPair>>> {
-    let mut cursor = try!(snapshot.iter(IterOption::default(), ScanMode::Forward));
-    if !try!(cursor.seek(start_key, &mut stats.data)) {
+    let mut cursor = snapshot.iter(IterOption::default(), ScanMode::Forward)?;
+    if !cursor.seek(start_key, &mut stats.data)? {
         return Ok(vec![]);
     }
     let mut pairs = vec![];
@@ -826,7 +831,7 @@ fn process_write_impl(
             );
             let rows = keys.len();
             for k in keys {
-                try!(txn.commit(k, commit_ts));
+                txn.commit(k, commit_ts)?;
             }
 
             let pr = ProcessResult::Res;
@@ -846,7 +851,7 @@ fn process_write_impl(
                 ctx.get_isolation_level(),
                 !ctx.get_not_fill_cache(),
             );
-            try!(txn.rollback(key));
+            txn.rollback(key)?;
 
             let pr = ProcessResult::Res;
             (pr, txn.modifies(), 1)
@@ -867,7 +872,7 @@ fn process_write_impl(
             );
             let rows = keys.len();
             for k in keys {
-                try!(txn.rollback(k));
+                txn.rollback(k)?;
             }
 
             let pr = ProcessResult::Res;
@@ -899,9 +904,9 @@ fn process_write_impl(
                 if ts > 0 {
                     try!(txn.commit(&key_lock.0, ts));
                 } else {
-                    try!(txn.commit(&key_lock.0));
-		        }
-		        modifies.append(&mut txn.modifies());
+                    try!(txn.rollback(&key_lock.0));
+		}
+		modifies.append(&mut txn.modifies());
                 if modifies.len() >= MAX_TXN_WRITE_SIZE {
                     scan_key = Some(key_lock.0.to_owned());
                     break;
@@ -939,7 +944,7 @@ fn process_write_impl(
             );
             let rows = keys.len();
             for k in keys {
-                try!(txn.gc(k, safe_point));
+                txn.gc(k, safe_point)?;
                 if txn.write_size() >= MAX_TXN_WRITE_SIZE {
                     scan_key = Some(k.to_owned());
                     break;
@@ -1010,7 +1015,7 @@ impl Scheduler {
 
     fn insert_ctx(&mut self, ctx: RunningCtx) {
         if ctx.lock.is_write_lock() {
-            self.running_write_count += 1;
+            self.running_write_kv_count += ctx.kv_count;
         }
         if ctx.tag == CMD_TAG_GC {
             self.has_gc_command = true;
@@ -1019,6 +1024,7 @@ impl Scheduler {
         if self.cmd_ctxs.insert(cid, ctx).is_some() {
             panic!("command cid={} shouldn't exist", cid);
         }
+        SCHED_WRITING_KV_GAUGE.set(self.running_write_kv_count as f64);
         SCHED_CONTEX_GAUGE.set(self.cmd_ctxs.len() as f64);
     }
 
@@ -1026,11 +1032,12 @@ impl Scheduler {
         let ctx = self.cmd_ctxs.remove(&cid).unwrap();
         assert_eq!(ctx.cid, cid);
         if ctx.lock.is_write_lock() {
-            self.running_write_count -= 1;
+            self.running_write_kv_count -= ctx.kv_count;
         }
         if ctx.tag == CMD_TAG_GC {
             self.has_gc_command = false;
         }
+        SCHED_WRITING_KV_GAUGE.set(self.running_write_kv_count as f64);
         SCHED_CONTEX_GAUGE.set(self.cmd_ctxs.len() as f64);
         ctx
     }
@@ -1132,7 +1139,7 @@ impl Scheduler {
     }
 
     fn too_busy(&self) -> bool {
-        self.running_write_count >= self.sched_too_busy_threshold
+        self.running_write_kv_count >= self.sched_too_busy_threshold
     }
 
     fn on_receive_new_cmd(&mut self, cmd: Command, callback: StorageCb) {
@@ -1511,7 +1518,10 @@ pub fn gen_command_lock(latches: &Latches, cmd: &Command) -> Lock {
             let keys: Vec<&Key> = mutations.iter().map(|x| x.key()).collect();
             latches.gen_lock(&keys)
         }
-        Command::ResolveLock { ref key_locks, .. } => latches.gen_lock(key_locks.map(|x| x.0).collect::<Vec<Key>>()),
+        Command::ResolveLock { ref key_locks, .. } => {
+	    let keys: Vec<&Key> = key_locks.iter().map(|x| &x.0).collect();
+            latches.gen_lock(&keys)
+	}
         Command::Commit { ref keys, .. } |
         Command::Rollback { ref keys, .. } => latches.gen_lock(keys),
         Command::Cleanup { ref key, .. } => latches.gen_lock(&[key]),
