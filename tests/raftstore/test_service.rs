@@ -384,12 +384,13 @@ fn test_mvcc_resolve_lock_gc_and_delete() {
     );
 
     // Resolve lock
+    let mut temp_map = HashMap::new();
     ts += 1;
     let resolve_lock_commit_version = ts;
     let mut resolve_lock_req = ResolveLockRequest::new();
     resolve_lock_req.set_context(ctx.clone());
-    resolve_lock_req.start_version = prewrite_start_version2;
-    resolve_lock_req.commit_version = resolve_lock_commit_version;
+    temp_map.insert(prewrite_start_version2, resolve_lock_commit_version);
+    resolve_lock_req.set_txn_infos(temp_map.clone());
     let resolve_lock_resp = client.kv_resolve_lock(resolve_lock_req).unwrap();
     assert!(!resolve_lock_resp.has_region_error());
     assert!(!resolve_lock_resp.has_error());

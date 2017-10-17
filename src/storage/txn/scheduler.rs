@@ -580,61 +580,12 @@ fn process_read(
                 Err(e) => ProcessResult::Failed { err: e.into() },
             }
         }
-        // Scan the locks with timestamp `start_ts`, then either commit them if the command has
-        // commit timestamp populated or rollback otherwise.
         Command::ResolveLock {
-            ref ctx,
-            start_ts,
-            commit_ts,
-            ref mut scan_key,
-            ..
-        } => {
-            let mut reader = MvccReader::new(
-                snapshot.as_ref(),
-                &mut statistics,
-                Some(ScanMode::Forward),
-                !ctx.get_not_fill_cache(),
-                None,
-                ctx.get_isolation_level(),
-            );
-            let res = reader
-                .scan_lock(
-                    scan_key.take(),
-                    |lock| lock.ts == start_ts,
-                    Some(RESOLVE_LOCK_BATCH_SIZE),
-                )
-                .map_err(Error::from)
-                .and_then(|(v, next_scan_key)| {
-                    let keys: Vec<Key> = v.into_iter().map(|x| x.0).collect();
-                    KV_COMMAND_KEYREAD_HISTOGRAM_VEC
-                        .with_label_values(&[tag])
-                        .observe(keys.len() as f64);
-                    if keys.is_empty() {
-                        Ok(None)
-                    } else {
-                        Ok(Some(Command::ResolveLock {
-                            ctx: ctx.clone(),
-                            start_ts: start_ts,
-                            commit_ts: commit_ts,
-                            scan_key: next_scan_key,
-                            keys: keys,
-                        }))
-                    }
-                });
-            match res {
-                Ok(Some(cmd)) => ProcessResult::NextCommand { cmd: cmd },
-                Ok(None) => ProcessResult::Res,
-                Err(e) => ProcessResult::Failed { err: e.into() },
-            }
-        }
-        // Batch lock resolve for read only
-        Command::BatchLockResolve {
             ref ctx,
             ref txn2status,
             ref mut scan_key,
             ..
         } => {
-	    info!("BatchLockResolve Invoked");
             let mut reader = MvccReader::new(
                 snapshot.as_ref(),
                 &mut statistics,
@@ -658,7 +609,7 @@ fn process_read(
                     if key_locks.is_empty() {
                         Ok(None)
                     } else {
-                        Ok(Some(Command::BatchLockResolve {
+                        Ok(Some(Command::ResolveLock {
                             ctx: ctx.clone(),
                             txn2status : txn2status.clone(),
                             scan_key: next_scan_key,
@@ -924,61 +875,10 @@ fn process_write_impl(
         }
         Command::ResolveLock {
             ref ctx,
-            start_ts,
-            commit_ts,
-            ref mut scan_key,
-            ref keys,
-        } => {
-            if let Some(cts) = commit_ts {
-                if cts <= start_ts {
-                    return Err(Error::InvalidTxnTso {
-                        start_ts: start_ts,
-                        commit_ts: cts,
-                    });
-                }
-            }
-            let mut scan_key = scan_key.take();
-            let mut txn = MvccTxn::new(
-                snapshot,
-                statistics,
-                start_ts,
-                None,
-                ctx.get_isolation_level(),
-                !ctx.get_not_fill_cache(),
-            );
-            let rows = keys.len();
-            for k in keys {
-                match commit_ts {
-                    Some(ts) => try!(txn.commit(k, ts)),
-                    None => try!(txn.rollback(k)),
-                }
-                if txn.write_size() >= MAX_TXN_WRITE_SIZE {
-                    scan_key = Some(k.to_owned());
-                    break;
-                }
-            }
-            if scan_key.is_none() {
-                (ProcessResult::Res, txn.modifies(), rows)
-            } else {
-                let pr = ProcessResult::NextCommand {
-                    cmd: Command::ResolveLock {
-                        ctx: ctx.clone(),
-                        start_ts: start_ts,
-                        commit_ts: commit_ts,
-                        scan_key: scan_key.take(),
-                        keys: vec![],
-                    },
-                };
-                (pr, txn.modifies() , rows)
-            }
-        }
-        Command::BatchLockResolve {
-            ref ctx,
             ref txn2status,
             ref mut scan_key,
             ref key_locks,
         } => {
-	    info!("Write BatchLockResolve Invoked");
             let mut scan_key = scan_key.take();
             let mut modifies : Vec<Modify> = vec![];
             let rows = key_locks.len();
@@ -997,23 +897,13 @@ fn process_write_impl(
                     None => panic!("txn status not found!"),
                 };
                 if ts > 0 {
-		    info!("we will commit");
-		    if let Err(e) = txn.commit(&key_lock.0, ts) {
-			info!("a commit tx failed");
-			return Err(Error::from(e))
-		    }
+                    try!(txn.commit(&key_lock.0, ts));
                 } else {
-		    info!("we will abort");
-		    if let Err(e) = txn.rollback(&key_lock.0) {
-			info!("a rollback tx failed");
-			return Err(Error::from(e))
-		    }
-                }
-	        info!("commit or abort successeds");
-		modifies.append(&mut txn.modifies());
+                    try!(txn.commit(&key_lock.0));
+		        }
+		        modifies.append(&mut txn.modifies());
                 if modifies.len() >= MAX_TXN_WRITE_SIZE {
                     scan_key = Some(key_lock.0.to_owned());
-                    //modifies.append(&mut txn.modifies());
                     break;
                 }
             }
@@ -1021,7 +911,7 @@ fn process_write_impl(
                 (ProcessResult::Res, modifies, rows)
             } else {
                 let pr = ProcessResult::NextCommand {
-                    cmd: Command::BatchLockResolve {
+                    cmd: Command::ResolveLock {
                         ctx: ctx.clone(),
                         txn2status : txn2status.clone(),
                         scan_key: scan_key.take(),
@@ -1623,7 +1513,7 @@ pub fn gen_command_lock(latches: &Latches, cmd: &Command) -> Lock {
         }
         Command::Commit { ref keys, .. } |
         Command::Rollback { ref keys, .. } |
-        Command::ResolveLock { ref keys, .. } => latches.gen_lock(keys),
+        Command::ResolveLock { ref key_locks, .. } => latches.gen_lock(key_locks.map(|x| x.0).collect::<Vec<Key>>()),
         Command::Cleanup { ref key, .. } => latches.gen_lock(&[key]),
         _ => Lock::new(vec![]),
     }
@@ -1638,6 +1528,8 @@ mod tests {
 
     #[test]
     fn test_command_latches() {
+        let mut temp_map = HashMap::new();
+        temp_map.insert(10, 20);
         let readonly_cmds = vec![
             Command::Get {
                 ctx: Context::new(),
@@ -1662,10 +1554,9 @@ mod tests {
             },
             Command::ResolveLock {
                 ctx: Context::new(),
-                start_ts: 10,
-                commit_ts: Some(20),
+                txn2status : temp_map.clone(),
                 scan_key: None,
-                keys: vec![],
+                key_locks: vec![],
             },
             Command::Gc {
                 ctx: Context::new(),
@@ -1709,8 +1600,7 @@ mod tests {
             },
             Command::ResolveLock {
                 ctx: Context::new(),
-                start_ts: 10,
-                commit_ts: Some(20),
+                txn2status: temp_map.clone(),
                 scan_key: None,
                 keys: vec![make_key(b"k")],
             },
