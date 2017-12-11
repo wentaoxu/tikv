@@ -82,6 +82,7 @@ macro_rules! printf {
 
 mod raftstore;
 mod mvcc;
+mod engine;
 
 fn print_result(smp: BenchSamples) {
     println!("{}", test::fmt_bench_samples(&smp));

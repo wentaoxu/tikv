@@ -33,6 +33,7 @@ mod channel;
 mod writebatch;
 mod serialization;
 mod coprocessor;
+mod module_bench;
 
 #[allow(dead_code)]
 #[path = "../tests/util/mod.rs"]
