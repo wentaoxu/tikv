@@ -99,4 +99,5 @@ fn main() {
     // TODO allow user to specify flag to just bench some cases.
     raftstore::bench_raftstore();
     mvcc::bench_engine();
+    engine::bench_engine();
 }
