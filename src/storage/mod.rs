@@ -1,4 +1,4 @@
-// Copyright 2016 PingCAP, Inc.
+// Copyright 2018 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::error;
 use std::io::Error as IoError;
+use std::thread;
 use std::u64;
 use kvproto::kvrpcpb::{CommandPri, Context, LockInfo};
 use kvproto::errorpb;
@@ -409,6 +410,7 @@ pub struct Storage {
 
     read_pool: ReadPool<ReadPoolContext>,
 
+    gc_worker: Builder,
     // Storage configurations.
     gc_ratio_threshold: f64,
     max_key_size: usize,
@@ -429,11 +431,14 @@ impl Storage {
                 .create(),
         ));
         let worker_scheduler = worker.lock().unwrap().scheduler();
+
+        let gc_worker = thread::Builder::new().name(thd_name!("gc-worker"));
         Ok(Storage {
             read_pool,
             engine: engine,
             worker: worker,
             worker_scheduler: worker_scheduler,
+            gc_worker: gc_worker,
             gc_ratio_threshold: config.gc_ratio_threshold,
             max_key_size: config.max_key_size,
         })

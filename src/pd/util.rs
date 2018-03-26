@@ -446,7 +446,7 @@ pub fn try_connect_leader(
     Err(box_err!("failed to connect to {:?}", members))
 }
 
-pub fn check_resp_header(header: &ResponseHeader) -> Result<()> {
+pub fn ?check_resp_header(header: &ResponseHeader) -> Result<()> {
     if !header.has_error() {
         return Ok(());
     }

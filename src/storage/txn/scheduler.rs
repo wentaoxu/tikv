@@ -359,8 +359,6 @@ pub struct Scheduler {
     // high priority commands will be delivered to this pool
     high_priority_pool: ThreadPool<SchedContext>,
 
-    has_gc_command: bool,
-
     // used to control write flow
     running_write_bytes: usize,
 }
@@ -428,7 +426,6 @@ impl Scheduler {
             high_priority_pool: ThreadPoolBuilder::with_default_factory(thd_name!(
                 "sched-high-pri-pool"
             )).build(),
-            has_gc_command: false,
             running_write_bytes: 0,
         }
     }
@@ -969,9 +966,7 @@ impl Scheduler {
         if ctx.lock.is_write_lock() {
             self.running_write_bytes += ctx.write_bytes;
         }
-        if ctx.tag == CMD_TAG_GC {
-            self.has_gc_command = true;
-        }
+
         let cid = ctx.cid;
         if self.cmd_ctxs.insert(cid, ctx).is_some() {
             panic!("command cid={} shouldn't exist", cid);
@@ -986,9 +981,7 @@ impl Scheduler {
         if ctx.lock.is_write_lock() {
             self.running_write_bytes -= ctx.write_bytes;
         }
-        if ctx.tag == CMD_TAG_GC {
-            self.has_gc_command = false;
-        }
+
         SCHED_WRITING_BYTES_GAUGE.set(self.running_write_bytes as f64);
         SCHED_CONTEX_GAUGE.set(self.cmd_ctxs.len() as f64);
         ctx
@@ -1116,19 +1109,7 @@ impl Scheduler {
             );
             return;
         }
-        // Allow 1 GC command at the same time.
-        if cmd.tag() == CMD_TAG_GC && self.has_gc_command {
-            SCHED_TOO_BUSY_COUNTER_VEC
-                .with_label_values(&[cmd.tag()])
-                .inc();
-            execute_callback(
-                callback,
-                ProcessResult::Failed {
-                    err: StorageError::SchedTooBusy,
-                },
-            );
-            return;
-        }
+
         self.schedule_command(cmd, callback);
     }
 

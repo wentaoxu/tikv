@@ -458,6 +458,30 @@ impl PdClient for RpcClient {
         check_resp_header(resp.get_header())
     }
 
+    fn get_user_kv(&self, mut key: &[u8]) -> Result<(&[u8], &[u8])> {
+        let _timer = PD_REQUEST_HISTOGRAM_VEC
+            .with_label_values(&["get_user_kv"])
+            .start_coarse_timer();
+
+        let mut req = pdpb::GetUserKVRequest::new();
+        req.set_header(self.header());
+        req.set_key(key.to_string());
+
+        let mut resp = sync_request(&self.leader_client, LEADER_CHANGE_RETRY, |client| {
+            let option = CallOption::default().timeout(Duration::from_secs(REQUEST_TIMEOUT));
+            client.get_user_kv_opt(&req, option)
+        })?;
+
+        check_resp_header(resp.get_header())?;
+
+        let key = resp.take_key();
+        if key.len() == 0 {
+            Err(Error::UserKeyNotFound(key.to_owned()))
+        }
+
+        Ok((key, resp.take_value()))
+    }
+
     fn handle_reconnect<F: Fn() + Sync + Send + 'static>(&self, f: F) {
         self.leader_client.on_reconnect(Box::new(f))
     }

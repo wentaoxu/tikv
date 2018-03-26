@@ -188,6 +188,9 @@ pub trait PdClient: Send + Sync {
         unimplemented!();
     }
 
+    // get kv for special purpose from pd.
+    fn get_user_kv(&self, mut key: &[u8]) -> Result<(&[u8], &[u8])> {}
+
     // Register a handler to the client, it will be invoked after reconnecting to PD.
     //
     // Please note that this method should only be called once.

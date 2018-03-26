@@ -45,6 +45,10 @@ quick_error!{
             description("region is not found")
             display("region is not found for key {:?}", key)
         }
+        UserKeyNotFound(key: Vec<u8>) {
+            description("user key is not found on pd")
+            display("user key {:?} is not found  on pd", key)
+        }
     }
 }
 

@@ -194,6 +194,7 @@ impl MvccTxn {
                         // TODO:None should not appear
                         // Rollbacked by concurrent transaction.
                         info!(
+
                             "txn conflict (lock not found), key:{}, start_ts:{}, commit_ts:{}",
                             key, self.start_ts, commit_ts
                         );
